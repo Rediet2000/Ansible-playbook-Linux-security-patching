@@ -1,0 +1,26 @@
+---
+# Fleet-wide patch policy. Override per group in group_vars/<group>.yml or per
+# host in the inventory.
+
+# Reboots are NEVER performed by this playbook. Hosts that need one are listed
+# in the report so a human can schedule the window.
+patch_allow_reboot: false
+
+# Services are not restarted either; needrestart findings are reported only.
+patch_restart_services: false
+
+# Security suites only (*-security, plus Ubuntu ESM infra/apps security).
+patch_security_only: true
+
+# Abort a host rather than let apt remove packages to satisfy the upgrade.
+patch_allow_removals: false
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+# Defined here rather than only in the role's defaults, because the summary play
+# does not apply the role and would otherwise have no value for these.
+patch_report_dir: "{{ playbook_dir | dirname }}/reports"
+
+# Every host in a run shares the id stamped once on localhost by the first play.
+patch_run_id: "{{ hostvars['localhost']['patch_run_stamp'] | default('adhoc') }}"

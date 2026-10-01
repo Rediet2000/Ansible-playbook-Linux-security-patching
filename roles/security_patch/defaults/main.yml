@@ -1,0 +1,72 @@
+---
+# ---------------------------------------------------------------------------
+# What to do
+# ---------------------------------------------------------------------------
+
+# false => plan and report only, nothing is installed. Also honours --check.
+patch_apply: true
+
+# Restrict upgrades to packages available from *-security suites.
+# false => upgrade everything apt offers (feature and bugfix updates too).
+patch_security_only: true
+
+# Reboots are never performed by this role. When a host needs one it is flagged
+# in the report. Set true only if you have also arranged a maintenance window;
+# the role still refuses unless patch_reboot_confirmed is true as well.
+patch_allow_reboot: false
+patch_reboot_confirmed: false
+
+# Restart services that needrestart flags as running stale libraries.
+patch_restart_services: false
+
+# Abort the host if apt wants to REMOVE packages to complete the upgrade.
+patch_allow_removals: false
+
+# Packages that must never be upgraded by this role. They are apt-held for the
+# duration of the run and released afterwards (pre-existing holds are left
+# alone), so dependencies cannot drag them in either.
+patch_exclude_packages: []
+
+# autoremove can delete old kernels, so it is opt-in.
+patch_autoremove: false
+patch_autoclean: false
+
+# ---------------------------------------------------------------------------
+# Safety thresholds
+# ---------------------------------------------------------------------------
+
+# Free space required before patching, in MiB, checked per mount point.
+patch_min_free_mb:
+  /: 512
+  /var: 1024
+  /boot: 200
+
+# Seconds to wait for another process to release the dpkg/apt lock.
+patch_lock_timeout: 300
+
+# Run `dpkg --configure -a` when a previous dpkg run was left half finished.
+# Off by default: an interrupted dpkg means a human should look first.
+patch_fix_broken_dpkg: false
+
+# Accept an apt cache this old (seconds) before refreshing it.
+patch_cache_valid_time: 3600
+
+# systemd units asserted active after patching. Empty by default; set per group.
+patch_verify_services: []
+
+# ---------------------------------------------------------------------------
+# Paths and reporting
+# ---------------------------------------------------------------------------
+
+# Isolated apt state on the managed host. Nothing outside this directory is
+# modified while working out which upgrades are security upgrades.
+patch_workdir: /var/lib/ansible-security-patch
+
+# Reports are written on the control node, one file per host plus a summary.
+patch_report_dir: "{{ playbook_dir | dirname }}/reports"
+patch_run_id: "{{ hostvars['localhost']['patch_run_stamp'] | default('adhoc') }}"
+patch_write_report: true
+
+# dpkg options that keep an unattended run from stopping at a conffile prompt.
+# force-confold keeps the local version of an edited config file.
+patch_dpkg_options: "force-confdef,force-confold"

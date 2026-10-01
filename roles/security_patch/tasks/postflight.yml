@@ -1,0 +1,126 @@
+---
+- name: Check whether the host needs a reboot
+  # Written by Debian/Ubuntu maintainer scripts when a package cannot take
+  # effect until reboot, most often the kernel, libc, dbus or systemd.
+  ansible.builtin.stat:
+    path: /var/run/reboot-required
+  register: patch_reboot_marker
+
+- name: Read the packages that asked for the reboot
+  ansible.builtin.slurp:
+    src: /var/run/reboot-required.pkgs
+  register: patch_reboot_pkgs_raw
+  when: patch_reboot_marker.stat.exists
+  failed_when: false
+
+- name: Record reboot state
+  ansible.builtin.set_fact:
+    patch_reboot_required: "{{ patch_reboot_marker.stat.exists }}"
+    patch_reboot_packages: >-
+      {{ (patch_reboot_pkgs_raw.content | default('') | b64decode).split('\n')
+         | select('truthy') | unique | sort }}
+
+- name: Look for needrestart
+  ansible.builtin.stat:
+    path: /usr/sbin/needrestart
+  register: patch_needrestart_bin
+
+- name: Ask needrestart which services run stale code
+  # Batch mode gives stable, machine-readable output. needrestart is not
+  # installed by this role on purpose: the role reports, and installing a
+  # package in order to report would be a change nobody asked for. Add
+  # needrestart to your base image to get this detail.
+  ansible.builtin.command:
+    cmd: /usr/sbin/needrestart -b
+  register: patch_needrestart
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: patch_needrestart_bin.stat.exists
+
+- name: Record stale services
+  ansible.builtin.set_fact:
+    patch_stale_services: >-
+      {{ patch_needrestart.stdout_lines | default([])
+         | select('match', '^NEEDRESTART-SVC:')
+         | map('regex_replace', '^NEEDRESTART-SVC: *', '') | unique | sort }}
+    # KSTA: 0 unknown, 1 running the current kernel, 2 ABI-compatible upgrade
+    # pending, 3 kernel version upgrade pending.
+    patch_kernel_status: >-
+      {{ (patch_needrestart.stdout_lines | default([])
+          | select('match', '^NEEDRESTART-KSTA:')
+          | map('regex_replace', '^NEEDRESTART-KSTA: *', '') | list
+          | first) | default('unknown') }}
+
+- name: Restart services running stale code
+  # Off by default. The fleet policy is report-only, so this stays opt-in.
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: restarted
+  loop: "{{ patch_stale_services | default([]) }}"
+  when:
+    - patch_restart_services | bool
+    - patch_stale_services | default([]) | length > 0
+
+- name: Record installed package versions after patching
+  ansible.builtin.command:
+    # argv form, not cmd: the cmd form is tokenised with shlex, which strips
+    # the backslashes from the tab and newline escapes and would collapse the
+    # whole package listing onto a single unusable line.
+    argv:
+      - dpkg-query
+      - --show
+      - --showformat=${Package}\t${Version}\n
+  register: patch_versions_after
+  changed_when: false
+  check_mode: false
+
+- name: Work out which package versions actually changed
+  ansible.builtin.set_fact:
+    patch_changed_packages: >-
+      {{ patch_versions_after.stdout_lines | default([])
+         | difference(patch_versions_before.stdout_lines | default([])) }}
+
+- name: Re-read the hold list
+  # A package still pending after patching was blocked by something: a hold, an
+  # apt pin, or a dependency apt declined to satisfy.
+  ansible.builtin.command:
+    cmd: apt-mark showhold
+  register: patch_holds_after
+  changed_when: false
+  check_mode: false
+
+- name: Gather service state
+  ansible.builtin.service_facts:
+  when: patch_verify_services | length > 0
+
+- name: Assert the services that must survive patching are running
+  vars:
+    # service_facts keys units as "nginx.service"; accept either spelling.
+    patch_svc: >-
+      {{ ansible_facts['services'][item]
+         | default(ansible_facts['services'][item ~ '.service'])
+         | default({}, true) }}
+  ansible.builtin.assert:
+    that:
+      - (patch_svc.state | default('not found')) == 'running'
+    fail_msg: >-
+      {{ item }} is not running after patching
+      (state={{ patch_svc.state | default('not found') }}). The package upgrade
+      may have restarted it into a failed state; check `journalctl -u {{ item }}`.
+    quiet: true
+  loop: "{{ patch_verify_services }}"
+  when: patch_verify_services | length > 0
+
+- name: Record the finish time
+  # Taken on the managed host, so it matches patch_started_at rather than
+  # mixing in the control node's clock.
+  ansible.builtin.command:
+    cmd: date -u +%Y-%m-%dT%H:%M:%SZ
+  register: patch_finished_raw
+  changed_when: false
+  check_mode: false
+
+- name: Publish the finish time
+  ansible.builtin.set_fact:
+    patch_finished_at: "{{ patch_finished_raw.stdout | trim }}"

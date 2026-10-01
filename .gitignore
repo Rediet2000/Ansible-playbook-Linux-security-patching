@@ -1,0 +1,6 @@
+logs/
+reports/*/
+!reports/.gitkeep
+*.retry
+.vault_pass
+__pycache__/

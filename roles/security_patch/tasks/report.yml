@@ -1,0 +1,63 @@
+---
+- name: Assemble this host's result
+  ansible.builtin.set_fact:
+    patch_result:
+      host: "{{ inventory_hostname }}"
+      distribution: >-
+        {{ ansible_facts['distribution'] }}
+        {{ ansible_facts['distribution_version'] }}
+        ({{ ansible_facts['distribution_release'] | default('?') }})
+      kernel: "{{ ansible_facts['kernel'] }}"
+      run_id: "{{ patch_run_id }}"
+      started_at: "{{ patch_started_at | default('') }}"
+      finished_at: "{{ patch_finished_at | default('') }}"
+      mode: >-
+        {{ 'check' if ansible_check_mode
+           else ('report-only' if not (patch_apply | bool) else 'apply') }}
+      security_only: "{{ patch_security_only | bool }}"
+      security_suites: "{{ patch_security_suites | default([]) }}"
+      failed: "{{ patch_failed | default(false) }}"
+      failure: "{{ patch_failure | default('') }}"
+      planned_upgrades: "{{ patch_plan.upgrades | default([]) }}"
+      planned_new_packages: "{{ patch_plan.new_packages | default([]) }}"
+      planned_removals: "{{ patch_plan.removals | default([]) }}"
+      changed_packages: "{{ patch_changed_packages | default([]) }}"
+      excluded_packages: "{{ patch_exclude_packages | default([]) }}"
+      excluded_with_pending_updates: "{{ patch_excluded_from_plan | default([]) }}"
+      holds_pre_existing: "{{ patch_holds_before.stdout_lines | default([]) }}"
+      holds_after_run: "{{ patch_holds_after.stdout_lines | default([]) }}"
+      reboot_required: "{{ patch_reboot_required | default(false) }}"
+      reboot_packages: "{{ patch_reboot_packages | default([]) }}"
+      stale_services: "{{ patch_stale_services | default([]) }}"
+      kernel_status: "{{ patch_kernel_status | default('unknown') }}"
+      verified_services: "{{ patch_verify_services | default([]) }}"
+
+- name: Make sure the report directory exists
+  ansible.builtin.file:
+    path: "{{ patch_report_dir }}/{{ patch_run_id }}"
+    state: directory
+    mode: "0755"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  check_mode: false
+
+- name: Write this host's machine-readable result
+  ansible.builtin.copy:
+    content: "{{ patch_result | to_nice_json }}\n"
+    dest: "{{ patch_report_dir }}/{{ patch_run_id }}/{{ inventory_hostname }}.json"
+    mode: "0644"
+  delegate_to: localhost
+  become: false
+  check_mode: false
+
+- name: Write this host's readable report
+  ansible.builtin.template:
+    src: host-report.md.j2
+    dest: "{{ patch_report_dir }}/{{ patch_run_id }}/{{ inventory_hostname }}.md"
+    mode: "0644"
+    trim_blocks: true
+    lstrip_blocks: true
+  delegate_to: localhost
+  become: false
+  check_mode: false

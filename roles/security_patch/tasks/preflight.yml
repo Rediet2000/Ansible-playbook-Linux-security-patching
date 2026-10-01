@@ -1,0 +1,120 @@
+---
+- name: Initialise run state
+  ansible.builtin.set_fact:
+    patch_failed: false
+    patch_holds_added: []
+    patch_excluded_from_plan: []
+    patch_started_at: "{{ ansible_facts['date_time']['iso8601'] }}"
+
+- name: Refuse to reboot unless it was confirmed explicitly
+  ansible.builtin.assert:
+    that:
+      - not (patch_allow_reboot | bool) or (patch_reboot_confirmed | bool)
+    fail_msg: >-
+      patch_allow_reboot is set but patch_reboot_confirmed is not. Set both only
+      inside an agreed maintenance window.
+    quiet: true
+
+- name: Wait for the dpkg lock to be free
+  # dpkg takes an fcntl (POSIX) lock, which flock(1) cannot see, so probe with
+  # the same lock type dpkg itself uses. An unattended-upgrades run triggered by
+  # the distro timer is the usual reason this is busy.
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - >-
+        import fcntl;
+        fcntl.lockf(open('/var/lib/dpkg/lock-frontend', 'a'),
+        fcntl.LOCK_EX | fcntl.LOCK_NB)
+  register: patch_lock_probe
+  changed_when: false
+  failed_when: false
+  retries: "{{ ((patch_lock_timeout | int) / 15) | round(0, 'ceil') | int }}"
+  delay: 15
+  until: patch_lock_probe.rc == 0
+
+- name: Fail if another package manager still holds the lock
+  ansible.builtin.fail:
+    msg: >-
+      /var/lib/dpkg/lock-frontend is still held after
+      {{ patch_lock_timeout }}s. Another apt, dpkg or unattended-upgrades run is
+      in progress; retry once it finishes.
+  when: patch_lock_probe.rc != 0
+
+- name: Look for a half-finished dpkg run
+  ansible.builtin.command:
+    cmd: dpkg --audit
+  register: patch_dpkg_audit
+  changed_when: false
+
+- name: Repair the half-finished dpkg run
+  ansible.builtin.command:
+    cmd: dpkg --configure --pending
+  when:
+    - patch_dpkg_audit.stdout | trim | length > 0
+    - patch_fix_broken_dpkg | bool
+  changed_when: true
+
+- name: Refuse to patch on top of a half-finished dpkg run
+  ansible.builtin.fail:
+    msg: >-
+      dpkg reports packages in a broken state, so patching would compound the
+      problem. Inspect `dpkg --audit` on this host, or re-run with
+      -e patch_fix_broken_dpkg=true to let the role run `dpkg --configure
+      --pending` first. Output was: {{ patch_dpkg_audit.stdout | trim }}
+  when:
+    - patch_dpkg_audit.stdout | trim | length > 0
+    - not (patch_fix_broken_dpkg | bool)
+
+- name: Check free space on patch-critical mount points
+  ansible.builtin.assert:
+    that:
+      - >-
+        (ansible_facts['mounts'] | selectattr('mount', 'equalto', item.key)
+         | map(attribute='size_available') | first) > (item.value | int * 1048576)
+    fail_msg: >-
+      {{ item.key }} has only
+      {{ ((ansible_facts['mounts'] | selectattr('mount', 'equalto', item.key)
+          | map(attribute='size_available') | first) / 1048576) | round(1) }}MiB
+      free, below the {{ item.value }}MiB required. A full /boot or /var is the
+      most common cause of a failed kernel or library upgrade.
+    quiet: true
+  # Only mount points that actually exist are checked: on a host without a
+  # separate /var, that space is already covered by the / check.
+  when: ansible_facts['mounts'] | selectattr('mount', 'equalto', item.key) | list | length > 0
+  loop: "{{ patch_min_free_mb | dict2items }}"
+  loop_control:
+    label: "{{ item.key }} >= {{ item.value }}MiB"
+
+- name: Record packages already on hold
+  # Pre-existing holds are deliberate operator decisions. They are reported, and
+  # the role must not release them when it releases its own holds.
+  ansible.builtin.command:
+    cmd: apt-mark showhold
+  register: patch_holds_before
+  changed_when: false
+
+- name: Record installed package versions before patching
+  ansible.builtin.command:
+    # argv form, not cmd: the cmd form is tokenised with shlex, which strips
+    # the backslashes from the tab and newline escapes and would collapse the
+    # whole package listing onto a single unusable line.
+    argv:
+      - dpkg-query
+      - --show
+      - --showformat=${Package}\t${Version}\n
+  register: patch_versions_before
+  changed_when: false
+
+- name: Refresh the standard apt cache
+  # The upgrade itself installs from the host's normal sources, so those lists
+  # must be current before exact security versions can be requested.
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: "{{ patch_cache_valid_time | int }}"
+    lock_timeout: "{{ patch_lock_timeout | int }}"
+  register: patch_cache_refresh
+  retries: 3
+  delay: 10
+  until: patch_cache_refresh is succeeded

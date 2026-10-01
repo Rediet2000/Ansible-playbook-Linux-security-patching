@@ -1,0 +1,86 @@
+---
+- name: Skip the upgrade
+  ansible.builtin.debug:
+    msg: >-
+      Nothing to do on {{ inventory_hostname }}
+      {{ '(no pending security updates)' if (patch_plan.upgrades | length == 0
+          and patch_plan.new_packages | length == 0)
+         else '(patch_apply is false, so the plan was reported only)' }}
+  when: >-
+    not (patch_apply | bool)
+    or (patch_plan.upgrades | length == 0 and patch_plan.new_packages | length == 0)
+
+- name: Apply the plan
+  when:
+    - patch_apply | bool
+    - (patch_plan.upgrades | length + patch_plan.new_packages | length) > 0
+  block:
+    # -----------------------------------------------------------------------
+    # Hold excluded packages so dependency resolution cannot drag them in
+    # -----------------------------------------------------------------------
+    - name: Decide which holds this run needs to add
+      # Packages an operator already held are excluded, so that releasing this
+      # run's holds in the always block cannot undo a deliberate standing hold.
+      # Recorded before the hold is taken, so a hold that fails half way through
+      # is still released during cleanup.
+      ansible.builtin.set_fact:
+        patch_holds_added: >-
+          {{ patch_exclude_packages
+             | difference(patch_holds_before.stdout_lines | default([])) }}
+
+    - name: Hold excluded packages for the duration of the run
+      ansible.builtin.command:
+        argv: "{{ ['apt-mark', 'hold'] + patch_holds_added }}"
+      when: patch_holds_added | length > 0
+      changed_when: true
+
+    # -----------------------------------------------------------------------
+    # Install, pinned to the exact versions the plan chose
+    # -----------------------------------------------------------------------
+    - name: Upgrade packages to their security versions
+      # Pinned to name=version from the plan so that a newer non-security
+      # version appearing in -updates between planning and applying cannot be
+      # pulled in instead. only_upgrade keeps this from installing anything new.
+      ansible.builtin.apt:
+        name: "{{ patch_plan.upgrades | map(attribute='pkgspec') | list }}"
+        state: present
+        only_upgrade: true
+        force_apt_get: true
+        dpkg_options: "{{ patch_dpkg_options }}"
+        lock_timeout: "{{ patch_lock_timeout | int }}"
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      register: patch_upgrade_result
+      when: patch_plan.upgrades | length > 0
+
+    - name: Install new packages the upgrade requires
+      # Usually a new kernel ABI package. Kept separate from the step above
+      # because only_upgrade would silently skip these, leaving a partial patch.
+      ansible.builtin.apt:
+        name: "{{ patch_plan.new_packages | map(attribute='pkgspec') | list }}"
+        state: present
+        force_apt_get: true
+        dpkg_options: "{{ patch_dpkg_options }}"
+        lock_timeout: "{{ patch_lock_timeout | int }}"
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      register: patch_newpkg_result
+      when: patch_plan.new_packages | length > 0
+
+    # -----------------------------------------------------------------------
+    # Optional housekeeping
+    # -----------------------------------------------------------------------
+    - name: Remove packages no longer required
+      ansible.builtin.apt:
+        autoremove: true
+        purge: false
+        force_apt_get: true
+        lock_timeout: "{{ patch_lock_timeout | int }}"
+      when: patch_autoremove | bool
+
+    - name: Clean obsolete archives from the apt cache
+      ansible.builtin.apt:
+        autoclean: true
+        force_apt_get: true
+        lock_timeout: "{{ patch_lock_timeout | int }}"
+      when: patch_autoclean | bool

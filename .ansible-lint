@@ -1,0 +1,9 @@
+---
+profile: production
+exclude_paths:
+  - reports/
+  - logs/
+skip_list:
+  # The apply step needs apt options the apt module cannot express, so a
+  # command task is used deliberately in a couple of places.
+  - command-instead-of-module

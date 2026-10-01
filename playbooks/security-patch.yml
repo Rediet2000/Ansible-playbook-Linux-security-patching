@@ -1,0 +1,73 @@
+---
+# Security patching for the Debian/Ubuntu fleet.
+#
+#   ansible-playbook playbooks/security-patch.yml --check      # dry run
+#   ansible-playbook playbooks/security-patch.yml -e patch_apply=false
+#   ansible-playbook playbooks/security-patch.yml
+#   ansible-playbook playbooks/security-patch.yml -l ubuntu
+#
+# This playbook never reboots and never restarts services. Hosts needing either
+# are listed in reports/<run-id>/summary.md.
+
+- name: Security patch | start the run
+  hosts: localhost
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Stamp a run id
+      # Set once here rather than per host: now() is re-evaluated on every
+      # reference, so a play-level var would give each batch a different id and
+      # scatter one run's reports across several directories.
+      ansible.builtin.set_fact:
+        patch_run_stamp: "{{ now(utc=true, fmt='%Y%m%dT%H%M%SZ') }}"
+
+    - name: Announce the run
+      ansible.builtin.debug:
+        msg: "Patch run {{ patch_run_id }} starting"
+
+- name: Security patch | apply
+  hosts: "{{ patch_target | default('linux') }}"
+  become: true
+  gather_facts: true
+
+  # Canary first, then quarter-of-the-fleet batches.
+  serial:
+    - 1
+    - "25%"
+
+  # Deterministic ordering, so the canary is always the first host listed in the
+  # inventory group rather than whichever host Ansible happens to pick.
+  order: inventory
+
+  # Any host failing aborts the whole run, so a bad package cannot roll on to
+  # the rest of the fleet. The failing host still writes its report.
+  any_errors_fatal: true
+
+  # Long apt transactions on slow links need more than the default.
+  vars:
+    ansible_command_timeout: 900
+
+  roles:
+    - role: security_patch
+
+- name: Security patch | summarise the run
+  hosts: "{{ patch_target | default('linux') }}"
+  gather_facts: false
+  become: false
+  run_once: true
+  tasks:
+    - name: Write the fleet summary
+      ansible.builtin.template:
+        src: templates/fleet-summary.md.j2
+        dest: "{{ patch_report_dir }}/{{ patch_run_id }}/summary.md"
+        mode: "0644"
+        trim_blocks: true
+        lstrip_blocks: true
+      delegate_to: localhost
+      check_mode: false
+
+    - name: Point at the summary
+      ansible.builtin.debug:
+        msg: >-
+          Reports written to
+          {{ patch_report_dir }}/{{ patch_run_id }}/ (start with summary.md)

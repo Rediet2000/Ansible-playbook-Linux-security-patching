@@ -1,0 +1,38 @@
+---
+# Regenerate the fleet summary for a previous run, including one that aborted
+# before the main playbook reached its summary play.
+#
+#   ansible-playbook playbooks/security-patch-summary.yml -e patch_run_id=20260928T101500Z
+#
+# The summary is rebuilt from the per-host JSON files, so no hosts are contacted.
+
+- name: Security patch | regenerate a run summary
+  hosts: localhost
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Require a run id
+      ansible.builtin.assert:
+        that:
+          - patch_run_id is defined
+          - patch_run_id | length > 0
+          - patch_run_id != 'adhoc'
+        fail_msg: >-
+          Pass the run to summarise, for example
+          -e patch_run_id=20260928T101500Z. Available runs:
+          {{ lookup('ansible.builtin.fileglob', patch_report_dir ~ '/*/*.json', wantlist=True)
+             | map('dirname') | map('basename') | unique | sort
+             | join(', ') | default('none found', true) }}
+        quiet: true
+
+    - name: Write the fleet summary
+      ansible.builtin.template:
+        src: templates/fleet-summary.md.j2
+        dest: "{{ patch_report_dir }}/{{ patch_run_id }}/summary.md"
+        mode: "0644"
+        trim_blocks: true
+        lstrip_blocks: true
+
+    - name: Point at the summary
+      ansible.builtin.debug:
+        msg: "Rewrote {{ patch_report_dir }}/{{ patch_run_id }}/summary.md"

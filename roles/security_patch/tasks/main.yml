@@ -1,0 +1,60 @@
+---
+- name: Confirm this host is Debian family
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['os_family'] == 'Debian'
+    fail_msg: >-
+      security_patch supports Debian-family hosts only, but {{ inventory_hostname }}
+      reports os_family={{ ansible_facts['os_family'] | default('unknown') }}.
+      Remove it from the patch group or add a role for its package manager.
+    quiet: true
+  tags: [always]
+
+- name: Patch this host
+  # The report must be written even when patching fails part way through,
+  # otherwise a failed run leaves no record of what it did before failing.
+  block:
+    - name: Run preflight checks
+      ansible.builtin.include_tasks: preflight.yml
+
+    - name: Build the security upgrade plan
+      ansible.builtin.include_tasks: plan.yml
+
+    - name: Apply the security upgrade plan
+      ansible.builtin.include_tasks: apply.yml
+
+    - name: Collect post-patch state
+      ansible.builtin.include_tasks: postflight.yml
+  rescue:
+    - name: Record that this host failed
+      ansible.builtin.set_fact:
+        patch_failed: true
+        patch_failure: "{{ ansible_failed_result.msg | default('see the run log') }}"
+
+    - name: Collect post-patch state after a failure
+      ansible.builtin.include_tasks: postflight.yml
+      ignore_errors: true
+
+    - name: Write the report before failing the host
+      ansible.builtin.include_tasks: report.yml
+      when: patch_write_report | bool
+      ignore_errors: true
+
+    - name: Fail the host
+      ansible.builtin.fail:
+        msg: "Security patching failed on {{ inventory_hostname }}: {{ patch_failure }}"
+  always:
+    - name: Release holds taken for this run
+      ansible.builtin.command:
+        argv: "{{ ['apt-mark', 'unhold'] + patch_holds_added }}"
+      when: patch_holds_added | default([]) | length > 0
+      changed_when: true
+      # A stale hold would silently block future patch runs, so never let a
+      # failure here go unnoticed, but never mask the original failure either.
+      failed_when: false
+
+- name: Write the patch report
+  ansible.builtin.include_tasks: report.yml
+  when:
+    - patch_write_report | bool
+    - not (patch_failed | default(false))

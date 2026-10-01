@@ -1,0 +1,96 @@
+{#
+  Fleet summary for one patch run.
+
+  Built by reading the per-host JSON files from the run directory rather than
+  from hostvars, so that this template also renders a summary for a run that
+  aborted part way through (see security-patch-summary.yml).
+#}
+{%- set run_dir = patch_report_dir ~ '/' ~ patch_run_id -%}
+{%- set results = [] -%}
+{%- for f in lookup('ansible.builtin.fileglob', run_dir ~ '/*.json', wantlist=True) | sort -%}
+{%-   set _ = results.append(lookup('ansible.builtin.file', f) | from_json) -%}
+{%- endfor -%}
+{%- set failed      = results | selectattr('failed') | list -%}
+{%- set rebooting   = results | selectattr('reboot_required') | list -%}
+{%- set stale       = results | selectattr('stale_services') | list -%}
+{%- set patched     = results | selectattr('changed_packages') | list -%}
+{%- set clean       = results | rejectattr('changed_packages') | rejectattr('failed') | list -%}
+{%- set skipped_exc = results | selectattr('excluded_with_pending_updates') | list -%}
+# Security patch run `{{ patch_run_id }}`
+
+Debian/Ubuntu fleet, security updates only. **This run did not reboot anything
+and did not restart any services** — that is the fleet policy, so the follow-up
+actions below are for a human to schedule.
+
+## At a glance
+
+| | Hosts |
+|---|---|
+| Reported | {{ results | length }} |
+| Failed | {{ failed | length }} |
+| Packages changed | {{ patched | length }} |
+| Already up to date | {{ clean | length }} |
+| **Reboot required** | **{{ rebooting | length }}** |
+| Services running stale code | {{ stale | length }} |
+| Excluded packages left vulnerable | {{ skipped_exc | length }} |
+
+{% if failed %}
+## Failed — investigate first
+
+{% for r in failed %}
+### `{{ r.host }}`
+
+{{ r.failure | default('see the run log') }}
+
+{% endfor %}
+{% endif %}
+{% if rebooting %}
+## Reboot required ({{ rebooting | length }})
+
+Schedule a window for these. Until they reboot they are still running the
+vulnerable kernel or libraries even though the new packages are installed.
+
+| Host | OS | Running kernel | Requested by |
+|---|---|---|---|
+{% for r in rebooting %}
+| `{{ r.host }}` | {{ r.distribution }} | {{ r.kernel }} | {{ r.reboot_packages | join(', ') if r.reboot_packages else 'unspecified' }} |
+{% endfor %}
+
+{% endif %}
+{% if stale %}
+## Services running pre-patch code ({{ stale | length }})
+
+These picked up new shared libraries on disk but the running processes still map
+the old ones. A service restart is enough; a reboot is not required.
+
+| Host | Services |
+|---|---|
+{% for r in stale %}
+| `{{ r.host }}` | {{ r.stale_services | join(', ') }} |
+{% endfor %}
+
+{% endif %}
+{% if skipped_exc %}
+## Deliberately left unpatched ({{ skipped_exc | length }})
+
+These packages are in `patch_exclude_packages` and had a security update
+available. Patch them by hand during a maintenance window.
+
+| Host | Package | Installed | Available |
+|---|---|---|---|
+{% for r in skipped_exc %}
+{% for pkg in r.excluded_with_pending_updates %}
+| `{{ r.host }}` | `{{ pkg.name }}` | {{ pkg.current | default('-') }} | {{ pkg.candidate }} |
+{% endfor %}
+{% endfor %}
+{% endif %}
+
+## Per host
+
+| Host | Mode | Planned | Changed | Reboot | Result |
+|---|---|---|---|---|---|
+{% for r in results %}
+| `{{ r.host }}` | {{ r.mode }} | {{ r.planned_upgrades | length + r.planned_new_packages | length }} | {{ r.changed_packages | length }} | {{ 'yes' if r.reboot_required else 'no' }} | {{ 'FAILED' if r.failed else 'ok' }} |
+{% endfor %}
+
+Per-host detail is in `{{ run_dir }}/<host>.md`.

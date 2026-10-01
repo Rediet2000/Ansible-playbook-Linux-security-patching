@@ -1,0 +1,182 @@
+---
+- name: Create the isolated apt workspace
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ patch_workdir }}"
+    - "{{ patch_workdir }}/sources.d"
+    - "{{ patch_workdir }}/lists"
+    # apt needs the partial/ subdirectory to exist before it will fetch.
+    - "{{ patch_workdir }}/lists/partial"
+
+- name: Install the helper scripts
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "{{ patch_workdir }}/{{ item }}"
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - apt-security-sources.py
+    - apt-plan-json.py
+
+# ---------------------------------------------------------------------------
+# Work out what "security" means on this host
+# ---------------------------------------------------------------------------
+
+- name: Derive this host's security-only apt sources
+  ansible.builtin.command:
+    cmd: "{{ patch_workdir }}/apt-security-sources.py"
+  register: patch_sources_raw
+  changed_when: false
+  check_mode: false
+  # Exit 3 means "no security source found"; the next task explains it.
+  failed_when: patch_sources_raw.rc not in [0, 3]
+  when: patch_security_only | bool
+
+- name: Fail when the host has no security source configured
+  ansible.builtin.fail:
+    msg: >-
+      No *-security suite is configured on {{ inventory_hostname }}, so a
+      security-only patch run cannot tell which upgrades are security upgrades.
+      Treating this as an error rather than reporting zero updates, because a
+      host with no security source looks identical to a fully patched one.
+      Sources scanned: {{ (patch_sources_raw.stdout | from_json).scanned | join(', ') }}
+  when:
+    - patch_security_only | bool
+    - patch_sources_raw.rc == 3
+
+- name: Publish the security-only source list
+  ansible.builtin.copy:
+    content: "{{ (patch_sources_raw.stdout | from_json).one_line }}"
+    dest: "{{ patch_workdir }}/security.list"
+    owner: root
+    group: root
+    mode: "0644"
+  when: patch_security_only | bool
+
+- name: Publish the security-only deb822 sources
+  ansible.builtin.copy:
+    content: "{{ (patch_sources_raw.stdout | from_json).deb822 }}"
+    dest: "{{ patch_workdir }}/sources.d/security.sources"
+    owner: root
+    group: root
+    mode: "0644"
+  when: patch_security_only | bool
+
+- name: Record which security suites were found
+  ansible.builtin.set_fact:
+    patch_security_suites: >-
+      {{ (patch_sources_raw.stdout | from_json).suites if (patch_security_only | bool) else ['(all suites)'] }}
+    patch_apt_isolation: >-
+      {{ ('-o Dir::Etc::SourceList=' ~ patch_workdir ~ '/security.list'
+          ~ ' -o Dir::Etc::SourceParts=' ~ patch_workdir ~ '/sources.d'
+          ~ ' -o Dir::State::Lists=' ~ patch_workdir ~ '/lists'
+          ~ ' -o APT::Get::List-Cleanup=0')
+         if (patch_security_only | bool) else '' }}
+
+# ---------------------------------------------------------------------------
+# Refresh only the security indices, in the isolated state directory
+# ---------------------------------------------------------------------------
+
+- name: Refresh the security indices
+  # APT::Update::Error-Mode=any promotes a failed index fetch from a warning to
+  # an error. Without it apt exits 0 after failing to reach the security mirror,
+  # which would produce an empty plan and a host that looks fully patched.
+  ansible.builtin.command:
+    cmd: >-
+      apt-get update {{ patch_apt_isolation }}
+      -o APT::Update::Error-Mode=any
+      -o DPkg::Lock::Timeout={{ patch_lock_timeout | int }}
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+  register: patch_sec_update
+  changed_when: false
+  check_mode: false
+  retries: 3
+  delay: 15
+  until: patch_sec_update is succeeded
+  when: patch_security_only | bool
+
+- name: List the fetched security indices
+  ansible.builtin.find:
+    paths: "{{ patch_workdir }}/lists"
+    patterns: "*Packages*"
+    file_type: file
+  register: patch_sec_indices
+  check_mode: false
+  when: patch_security_only | bool
+
+- name: Fail when no security index was fetched
+  # Second guard, for apt versions that ignore APT::Update::Error-Mode.
+  ansible.builtin.fail:
+    msg: >-
+      apt fetched no package index for
+      {{ patch_security_suites | join(', ') }}. The security mirror is
+      unreachable from this host, so the upgrade plan would be empty and
+      misleading. Check egress to the security mirror and retry.
+  when:
+    - patch_security_only | bool
+    - patch_sec_indices.matched | int == 0
+
+# ---------------------------------------------------------------------------
+# Simulate the upgrade
+# ---------------------------------------------------------------------------
+
+- name: Simulate the upgrade to build the plan
+  ansible.builtin.command:
+    cmd: >-
+      {{ patch_workdir }}/apt-plan-json.py {{ patch_apt_isolation }}
+      -o DPkg::Lock::Timeout={{ patch_lock_timeout | int }}
+  register: patch_plan_raw
+  changed_when: false
+  # A simulation changes nothing, so it must still run under --check; otherwise
+  # a check run could not report what it would do.
+  check_mode: false
+
+- name: Parse the plan
+  ansible.builtin.set_fact:
+    patch_plan: "{{ patch_plan_raw.stdout | from_json }}"
+
+- name: Note which excluded packages had a security update pending
+  # Recorded before the plan is filtered, so the report can show that an
+  # excluded package is sitting on a known-vulnerable version.
+  ansible.builtin.set_fact:
+    patch_excluded_from_plan: >-
+      {{ (patch_plan.upgrades + patch_plan.new_packages)
+         | selectattr('name', 'in', patch_exclude_packages) | list }}
+  when: patch_exclude_packages | length > 0
+
+- name: Drop excluded packages from the plan
+  ansible.builtin.set_fact:
+    patch_plan: >-
+      {{ patch_plan | combine({
+           'upgrades': patch_plan.upgrades
+             | rejectattr('name', 'in', patch_exclude_packages) | list,
+           'new_packages': patch_plan.new_packages
+             | rejectattr('name', 'in', patch_exclude_packages) | list,
+         }) }}
+  when: patch_exclude_packages | length > 0
+
+- name: Refuse to patch when apt wants to remove packages
+  ansible.builtin.fail:
+    msg: >-
+      apt would REMOVE {{ patch_plan.removals | map(attribute='name') | join(', ') }}
+      to complete this upgrade. Refusing, because an unattended security patch
+      should never delete software. Resolve the dependency conflict by hand, or
+      re-run with -e patch_allow_removals=true if the removals are expected.
+  when:
+    - patch_plan.removals | length > 0
+    - not (patch_allow_removals | bool)
+
+- name: Report the plan
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: {{ patch_plan.upgrades | length }} security
+      upgrade(s), {{ patch_plan.new_packages | length }} new package(s)
+      from {{ patch_security_suites | join(', ') }}
+      {{ '(apply disabled, reporting only)' if not (patch_apply | bool) else '' }}

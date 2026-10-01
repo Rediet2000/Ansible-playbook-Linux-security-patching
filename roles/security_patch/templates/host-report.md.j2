@@ -1,0 +1,115 @@
+{# Per-host security patch report. Rendered on the control node. #}
+# Security patch report: {{ patch_result.host }}
+
+| | |
+|---|---|
+| Run | `{{ patch_result.run_id }}` |
+| Mode | **{{ patch_result.mode }}** |
+| Result | {{ '**FAILED**' if patch_result.failed else 'ok' }} |
+| OS | {{ patch_result.distribution }} |
+| Kernel | {{ patch_result.kernel }} |
+| Started | {{ patch_result.started_at }} |
+| Finished | {{ patch_result.finished_at }} |
+| Scope | {{ 'security suites only' if patch_result.security_only else 'all available updates' }} |
+| Suites | {{ patch_result.security_suites | join(', ') if patch_result.security_suites else 'n/a' }} |
+{% if patch_result.failed %}
+
+## Failure
+
+```
+{{ patch_result.failure }}
+```
+{% endif %}
+
+## Action required
+
+{% if patch_result.reboot_required %}
+- **Reboot pending.** This playbook never reboots; schedule one.
+{% if patch_result.reboot_packages %}
+  Requested by: {{ patch_result.reboot_packages | join(', ') }}
+{% endif %}
+{% else %}
+- No reboot required.
+{% endif %}
+{% if patch_result.kernel_status == '3' %}
+- **Running an older kernel than the one installed.** Only a reboot fixes this.
+{% elif patch_result.kernel_status == '2' %}
+- Kernel upgrade pending, ABI compatible with the running kernel.
+{% endif %}
+{% if patch_result.stale_services %}
+- **{{ patch_result.stale_services | length }} service(s) still running pre-patch code** and need a restart to pick up the new libraries:
+{% for svc in patch_result.stale_services %}
+  - `{{ svc }}`
+{% endfor %}
+{% endif %}
+{% if patch_result.excluded_with_pending_updates %}
+- **{{ patch_result.excluded_with_pending_updates | length }} excluded package(s) have a security update available and were deliberately left unpatched:**
+{% for pkg in patch_result.excluded_with_pending_updates %}
+  - `{{ pkg.name }}` {{ pkg.current | default('(not installed)') }} -> {{ pkg.candidate }}
+{% endfor %}
+{% endif %}
+{% if patch_result.planned_removals %}
+- apt wanted to remove: {{ patch_result.planned_removals | map(attribute='name') | join(', ') }}
+{% endif %}
+{% if not patch_result.reboot_required and not patch_result.stale_services
+      and not patch_result.excluded_with_pending_updates %}
+- Nothing outstanding.
+{% endif %}
+
+## Planned
+
+{% if patch_result.planned_upgrades or patch_result.planned_new_packages %}
+{{ patch_result.planned_upgrades | length }} upgrade(s), {{ patch_result.planned_new_packages | length }} new package(s).
+
+| Package | From | To | Origin |
+|---|---|---|---|
+{% for pkg in patch_result.planned_upgrades %}
+| `{{ pkg.name }}` | {{ pkg.current }} | {{ pkg.candidate }} | {{ pkg.origin }} |
+{% endfor %}
+{% for pkg in patch_result.planned_new_packages %}
+| `{{ pkg.name }}` | _new_ | {{ pkg.candidate }} | {{ pkg.origin }} |
+{% endfor %}
+{% else %}
+No pending security updates.
+{% endif %}
+
+## Applied
+
+{% if patch_result.mode != 'apply' %}
+Nothing was installed ({{ patch_result.mode }} mode).
+{% elif patch_result.changed_packages %}
+{{ patch_result.changed_packages | length }} package version(s) changed on disk:
+
+```
+{% for line in patch_result.changed_packages %}
+{{ line }}
+{% endfor %}
+```
+{% else %}
+No package versions changed.
+{% endif %}
+
+## Holds
+
+{% if patch_result.holds_pre_existing %}
+Held before the run (left untouched): {{ patch_result.holds_pre_existing | join(', ') }}
+{% else %}
+No packages were held before the run.
+{% endif %}
+{% if patch_result.holds_after_run %}
+
+Held after the run: {{ patch_result.holds_after_run | join(', ') }}
+{% endif %}
+{% if patch_result.holds_after_run | difference(patch_result.holds_pre_existing) %}
+
+> **Leftover holds:**
+> {{ patch_result.holds_after_run | difference(patch_result.holds_pre_existing) | join(', ') }}.
+> These were not held before the run and would block future patching. Release
+> them with `apt-mark unhold`.
+{% endif %}
+{% if patch_result.verified_services %}
+
+## Verified running
+
+{{ patch_result.verified_services | join(', ') }}
+{% endif %}
